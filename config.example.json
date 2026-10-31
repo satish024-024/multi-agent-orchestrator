@@ -1,0 +1,64 @@
+{
+  "antigravity": {
+    "complex_effort": "high",
+    "complex_model": "claude-opus-4-6-thinking",
+    "default_effort": "low",
+    "default_model": "gemini-3.8-flash-low",
+    "ready_timeout_seconds": 60,
+    "run_timeout_seconds": 900
+  },
+  "binaries": {
+    "agy": "$HOME/.local/bin/agy",
+    "opencode": "$HOME/.opencode/bin/opencode",
+    "qoder": "qoder"
+  },
+  "opencode": {
+    "complex_model": "opencode/deepseek-v4.1-flash",
+    "config_file": "$HOME/orchestrator/opencode-safe.json",
+    "default_model": "opencode/nemotron-3-ultra-free",
+    "ready_timeout_seconds": 120,
+    "run_timeout_seconds": 600
+  },
+  "paths": {
+    "logs": "$HOME/orchestrator/logs",
+    "tasks": "$HOME/orchestrator/tasks"
+  },
+  "qoder": {
+    "alt_model": "Qwen3.8-Flash",
+    "default_model": "DeepSeek-Flash",
+    "ready_timeout_seconds": 60,
+    "run_timeout_seconds": 600
+  },
+  "routing": {
+    "complexity_backend": {
+      "high": "antigravity",
+      "low": "qoder",
+      "medium": "qoder"
+    },
+    "default_backend": "qoder",
+    "fallback_on": [
+      "rate_limit",
+      "auth",
+      "timeout",
+      "model_error"
+    ],
+    "max_retries_per_backend": 2,
+    "no_fallback_on": [
+      "network"
+    ],
+    "retry_backoff_base_seconds": 5
+  },
+  "safety": {
+    "actions_requiring_approval": [
+      "push",
+      "deploy",
+      "publish",
+      "migrate_production",
+      "spend"
+    ],
+    "allow_destructive_commands": false,
+    "auto_approve_backend_permissions": false,
+    "require_clean_for_destructive": true
+  },
+  "version": "1.0.0"
+}

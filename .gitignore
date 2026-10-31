@@ -1,0 +1,16 @@
+# Local machine config (use config.example.json as the template)
+config.json
+
+# Runtime state
+logs/
+tasks/
+graphify-out/
+
+# Backups and local copies
+*.bak
+*.bak-*
+*.orig
+
+# OS/editor noise
+.DS_Store
+*.swp

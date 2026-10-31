@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# orchestrator — route coding tasks to Qoder, OpenCode or Antigravity.
+# Usage:
+#   orchestrator status
+#   orchestrator plan "<task>" [--complexity low|medium|high] [--dir DIR]
+#   orchestrator run "<task>" [--backend qoder|opencode|antigravity] [--complexity C]
+#                              [--dir DIR] [--timeout S] [--allow-dirty] [--worktree BRANCH]
+#   orchestrator logs <task-id> [--tail N]
+#   orchestrator resume <task-id> [--timeout S]
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CFG="$ROOT/config.json"
+TASKDIR="$(jq -r '.paths.tasks' "$CFG")"
+LOGDIR="$(jq -r '.paths.logs' "$CFG")"
+CACHE="$TASKDIR/.ready_cache.json"
+mkdir -p "$TASKDIR" "$LOGDIR"
+
+# shellcheck disable=SC1091
+source "$ROOT/backends/opencode.sh"
+# shellcheck disable=SC1091
+source "$ROOT/backends/antigravity.sh"
+# shellcheck disable=SC1091
+source "$ROOT/backends/qoder.sh"
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() { echo "[$(ts)] $*" >&2; }
+
+new_task_id() {
+  # Unique across concurrent invocations: nanosecond timestamp + PID (no shared counter).
+  printf 't-%s-%s' "$(date +%Y%m%d-%H%M%S-%N)" "$$"
+}
+
+command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required but not installed" >&2; exit 2; }
+
+# ---- readiness (cached 10 min) ----
+# Cache recomputation is serialized with flock, and failures are NEVER cached:
+# a transient smoke timeout under concurrent load must not poison the cache
+# for other runners. Stale cache is served while revalidation is in progress.
+readiness() {
+  local now cached_at oc_ver oc_ready ag_ver ag_ready result
+  now=$(date +%s); cached_at=0
+  [ -f "$CACHE" ] && cached_at=$(jq -r '.checked_at // 0' "$CACHE")
+  if [ $((now - cached_at)) -lt 600 ]; then cat "$CACHE"; return; fi
+
+  exec 9>"$CACHE.lock"
+  if flock -w 180 9 2>/dev/null; then
+    # Re-check after acquiring the lock; a sibling may have refreshed it.
+    cached_at=$(jq -r '.checked_at // 0' "$CACHE" 2>/dev/null || echo 0)
+    if [ $((now - cached_at)) -lt 600 ]; then cat "$CACHE"; return; fi
+  elif [ -f "$CACHE" ]; then
+    # Another runner is revalidating; serve stale cache rather than blocking.
+    cat "$CACHE"; return
+  fi
+
+  oc_ver=""; oc_ready="no"; ag_ver=""; ag_ready="no"; qd_ver=""; qd_ready="no"
+  if oc_ver=$(oc_available 2>/dev/null); then
+    oc_ready="smoke"
+    if oc_smoke "/tmp" "$(jq -r '.opencode.default_model' "$CFG")" 45 2>/dev/null; then oc_ready="yes"; else oc_ready="degraded"; fi
+  fi
+  if ag_ver=$(ag_available 2>/dev/null); then
+    ag_ready="auth-failed"
+    if ag_auth_ready 2>/dev/null; then
+      ag_ready="smoke"
+      if ag_smoke "/tmp" 60 2>/dev/null; then ag_ready="yes"; else ag_ready="degraded"; fi
+    fi
+  fi
+  if qd_ver=$(qd_available 2>/dev/null); then
+    qd_ready="auth-failed"
+    if qd_auth_ready 2>/dev/null; then
+      qd_ready="smoke"
+      if qd_smoke "/tmp" "$(jq -r '.qoder.default_model' "$CFG")" 60 2>/dev/null; then qd_ready="yes"; else qd_ready="degraded"; fi
+    fi
+  fi
+  result=$(jq -n --arg ocv "$oc_ver" --arg ocr "$oc_ready" --arg agv "$ag_ver" --arg agr "$ag_ready" \
+    --arg qdv "$qd_ver" --arg qdr "$qd_ready" \
+    --argjson ts "$now" \
+    '{checked_at:$ts, opencode:{version:$ocv, readiness:$ocr}, antigravity:{version:$agv, readiness:$agr}, qoder:{version:$qdv, readiness:$qdr}}')
+  # Cache only usable results; a total failure is served once, never persisted.
+  if [ "$oc_ready" = "yes" ] || [ "$ag_ready" = "yes" ] || [ "$qd_ready" = "yes" ]; then
+    printf '%s\n' "$result" | tee "$CACHE"
+  else
+    printf '%s\n' "$result"
+  fi
+}
+
+cmd_status() {
+  local r ocv ocr agv agr qdv qdr
+  r=$(readiness)
+  ocv=$(jq -r '.opencode.version' <<<"$r"); ocr=$(jq -r '.opencode.readiness' <<<"$r")
+  agv=$(jq -r '.antigravity.version' <<<"$r"); agr=$(jq -r '.antigravity.readiness' <<<"$r")
+  qdv=$(jq -r '.qoder.version // ""' <<<"$r"); qdr=$(jq -r '.qoder.readiness // "unknown"' <<<"$r")
+  echo "== Orchestrator status =="
+  echo "qoder       : version=${qdv:-MISSING} readiness=$qdr model=$(jq -r '.qoder.default_model' "$CFG")"
+  echo "opencode    : version=${ocv:-MISSING} readiness=$ocr model=$(jq -r '.opencode.default_model' "$CFG")"
+  echo "antigravity : version=${agv:-MISSING} readiness=$agr model=$(jq -r '.antigravity.default_model' "$CFG")"
+  echo "policy      : routine->qoder, complex->antigravity, fallback chain qoder>antigravity>opencode (config.json: routing.*)"
+  echo "tasks dir   : $TASKDIR   logs dir: $LOGDIR"
+}
+
+# ---- task record ----
+write_task() { # id, json via stdin
+  jq --arg ts "$(ts)" '.updated_at=$ts' > "$TASKDIR/$1.json"
+}
+handoff_note() { # id
+  local t="$1"
+  {
+    echo "# Task $t — handoff note ($(ts))"
+    jq -r '"- description: \(.description)", "- backend: \(.backend) (\(.model))", "- status: \(.status)", "- workdir: \(.workdir)", "- complexity: \(.complexity)"' "$TASKDIR/$t.json"
+    echo "- changed files:"
+    jq -r '.changed_files[]? | "  - \(.)"' "$TASKDIR/$t.json"
+    echo "- result:"
+    jq -r '.result | tostring' "$TASKDIR/$t.json" | head -20
+    echo "- resume: orchestrator resume $t"
+  } > "$TASKDIR/$t.md"
+}
+
+# ---- plan ----
+cmd_plan() {
+  local task="$1"; shift
+  local complexity="" dir="$PWD"
+  while [ $# -gt 0 ]; do case "$1" in
+    --complexity) complexity="$2"; shift 2;; --dir) dir="$2"; shift 2;; *) shift;; esac; done
+  local r oc_ready ag_ready qd_ready route
+  r=$(readiness)
+  [ "$(jq -r '.opencode.readiness' <<<"$r")" = "yes" ] && oc_ready=yes || oc_ready=no
+  [ "$(jq -r '.antigravity.readiness' <<<"$r")" = "yes" ] && ag_ready=yes || ag_ready=no
+  [ "$(jq -r '.qoder.readiness // "no"' <<<"$r")" = "yes" ] && qd_ready=yes || qd_ready=no
+  if route=$("$ROOT/router.sh" "$complexity" "" "$oc_ready" "$ag_ready" "$qd_ready" 2>/dev/null); then
+    echo "== Plan (no execution) =="
+    echo "task       : $task"
+    echo "workdir    : $dir"
+    echo "complexity : ${complexity:-unspecified}"
+    echo "routing    : $(jq -r '.backend' <<<"$route") ($(jq -r '.model' <<<"$route"))"
+    echo "reason     : $(jq -r '.reason' <<<"$route")"
+    echo "steps run would take:"
+    echo "  1. record git status/diff of $dir into task record"
+    echo "  2. execute via $(jq -r '.backend' <<<"$route") with timeout, capture structured output"
+    echo "  3. on failure class in $(jq -r '.routing.fallback_on|join(",")' "$CFG"): bounded retry, then fallback to other backend"
+    echo "  4. write task record + handoff note to $TASKDIR"
+  else
+    echo "BLOCKED: $(jq -r '.reason' <<<"$route")"
+    return 3
+  fi
+}
+
+# ---- run ----
+cmd_run() {
+  local task="$1"; shift
+  local complexity="" backend="" dir="$PWD" timeout_s="" allow_dirty="no" worktree_branch=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --backend) backend="$2"; shift 2;; --complexity) complexity="$2"; shift 2;;
+    --dir) dir="$2"; shift 2;; --timeout) timeout_s="$2"; shift 2;;
+    --allow-dirty) allow_dirty="yes"; shift;; --worktree) worktree_branch="$2"; shift 2;; *) shift;; esac; done
+  [ -d "$dir" ] || { echo "ERROR: dir not found: $dir" >&2; return 2; }
+
+  # Isolated worktree for parallel/conflicting work (Phase 5).
+  local worktree_dir="" orig_dir="$dir" task_ok=0
+  cleanup_worktree() {
+    if [ -n "${worktree_dir:-}" ] && [ "${task_ok:-0}" != "1" ]; then
+      git -C "$orig_dir" worktree remove --force "$worktree_dir" 2>/dev/null || true
+      git -C "$orig_dir" worktree prune 2>/dev/null || true
+    fi
+  }
+  trap cleanup_worktree INT TERM EXIT
+  if [ -n "$worktree_branch" ]; then
+    git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: --worktree needs a git repo: $dir" >&2; return 2; }
+    worktree_dir=$(mktemp -d)/wt
+    git -C "$dir" worktree add -b "$worktree_branch" "$worktree_dir" >/dev/null 2>&1 \
+      || git -C "$dir" worktree add "$worktree_dir" "$worktree_branch" >/dev/null 2>&1 \
+      || { echo "ERROR: could not create worktree $worktree_branch" >&2; return 2; }
+    dir="$worktree_dir"
+    log "isolated worktree: $worktree_branch -> $dir (kept on success for coordinator review/merge, removed on failure)"
+  fi
+
+  local id tid_log r oc_ready ag_ready qd_ready route bmodel bbackend reason
+  id=$(new_task_id); tid_log="$LOGDIR/$id.log"
+
+  # git gate: record status; refuse only with --require-clean semantics via allow_dirty=no default? No:
+  # default records; dirty is allowed but recorded as "understood". Destructive ops still need approval (config).
+  local git_status="not-a-repo"
+  if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    git_status=$(git -C "$dir" status --porcelain | head -20 | tr '\n' ';')
+    [ -z "$git_status" ] && git_status="clean"
+  fi
+
+  r=$(readiness)
+  [ "$(jq -r '.opencode.readiness' <<<"$r")" = "yes" ] && oc_ready=yes || oc_ready=no
+  [ "$(jq -r '.antigravity.readiness' <<<"$r")" = "yes" ] && ag_ready=yes || ag_ready=no
+  [ "$(jq -r '.qoder.readiness // "no"' <<<"$r")" = "yes" ] && qd_ready=yes || qd_ready=no
+  if ! route=$("$ROOT/router.sh" "$complexity" "$backend" "$oc_ready" "$ag_ready" "$qd_ready"); then
+    jq -n --arg id "$id" --arg d "$task" --arg dir "$dir" --arg c "$complexity" \
+      '{id:$id, description:$d, workdir:$dir, complexity:$c, status:"blocked", result:{reason:"no usable backend"}}' \
+      | write_task "$id"; handoff_note "$id"
+    echo "BLOCKED task $id: $(jq -r '.reason' <<<"$route")"; return 3
+  fi
+  bbackend=$(jq -r '.backend' <<<"$route"); bmodel=$(jq -r '.model' <<<"$route"); reason=$(jq -r '.reason' <<<"$route")
+  [ -z "$timeout_s" ] && timeout_s=$(jq -r --arg b "$bbackend" '.[$b].run_timeout_seconds' "$CFG")
+
+  jq -n --arg id "$id" --arg d "$task" --arg dir "$dir" --arg c "${complexity:-unspecified}" \
+    --arg b "$bbackend" --arg m "$bmodel" --arg gs "$git_status" --argjson t "$timeout_s" \
+    --arg wt "${worktree_dir:-}" \
+    '{id:$id, description:$d, workdir:$dir, complexity:$c, backend:$b, model:$m,
+      timeout_seconds:$t, status:"running", git_status_before:$gs, worktree:$wt, logs:[], changed_files:[],
+      result:{}, handoff:""}' | write_task "$id"
+
+  log "task $id -> $bbackend ($bmodel): $reason"
+  execute_backend "$id" "$bbackend" "$bmodel" "$dir" "$timeout_s" "" "$task" "$tid_log"
+  local code=$?
+  [ "$code" -eq 0 ] && task_ok=1
+  trap - INT TERM EXIT
+  cleanup_worktree   # removes worktree only when task_ok != 1
+  handoff_note "$id"
+  echo "task $id finished: status=$(jq -r '.status' "$TASKDIR/$id.json")"
+  return "$code"
+}
+
+# execute_backend <id> <backend> <model> <dir> <timeout> <resume_token> <prompt> <logfile> [already_fell_back:0|1]
+execute_backend() {
+  local id="$1" bbackend="$2" bmodel="$3" dir="$4" timeout_s="$5" resume_token="$6" prompt="$7" tid_log="$8"
+  local already_fell_back="${9:-0}"
+  local out class conv sid max_retries backoff attempt=1
+  max_retries=$(jq -r '.routing.max_retries_per_backend' "$CFG")
+  backoff=$(jq -r '.routing.retry_backoff_base_seconds' "$CFG")
+
+  while [ "$attempt" -le "$max_retries" ]; do
+    log "attempt $attempt/$max_retries on $bbackend"
+    if [ "$bbackend" = "opencode" ]; then
+      out=$(echo "$prompt" | oc_run "$dir" "$bmodel" "$timeout_s" "$resume_token" "$tid_log") || true
+      sid=$(sed -n 's/.*session=\([^ ]*\).*/\1/p' <<<"$out"); [ "$sid" = "none" ] && sid=""
+      conv="$sid"
+    elif [ "$bbackend" = "qoder" ]; then
+      out=$(echo "$prompt" | qd_run "$dir" "$bmodel" "$timeout_s" "$resume_token" "$tid_log") || true
+      sid=$(sed -n 's/.*session=\([^ ]*\).*/\1/p' <<<"$out"); [ "$sid" = "none" ] && sid=""
+      conv="$sid"
+    else
+      local effort; effort=$(jq -r '.antigravity.default_effort' "$CFG")
+      out=$(echo "$prompt" | ag_run "$dir" "$bmodel" "$effort" "$timeout_s" "$resume_token" "$tid_log") || true
+      conv=$(sed -n 's/.*conversation=\([^ ]*\).*/\1/p' <<<"$out"); [ "$conv" = "none" ] && conv=""
+      sid=""
+    fi
+    class=$(sed -n 's/.*error=\([^ ]*\).*/\1/p' <<<"$out")
+    if [ "$class" = "ok" ]; then
+      record_result "$id" done "$bbackend" "$bmodel" "$conv" "$sid" "$tid_log" "success"
+      return 0
+    fi
+    log "attempt $attempt failed: class=$class"
+    if jq -e --arg c "$class" '.routing.fallback_on | index($c)' "$CFG" >/dev/null; then
+      sleep $((backoff * attempt))
+      attempt=$((attempt + 1))
+    else
+      record_result "$id" failed "$bbackend" "$bmodel" "$conv" "$sid" "$tid_log" "error_class=$class (no fallback per policy)"
+      return 1
+    fi
+  done
+
+  # retries exhausted on this backend -> single fallback to the next ready
+  # backend in preference order antigravity > qoder > opencode (never
+  # ping-pongs: already_fell_back guards recursion)
+  local other="" other_ready="no" cand
+  for cand in antigravity qoder opencode; do
+    [ "$cand" = "$bbackend" ] && continue
+    cand_ready="no"
+    if [ -f "$CACHE" ]; then cand_ready=$(jq -r --arg b "$cand" '.[$b].readiness // "no"' "$CACHE" 2>/dev/null || echo "no"); fi
+    if [ "$cand_ready" = "yes" ]; then other="$cand"; other_ready="yes"; break; fi
+  done
+  if [ "$other_ready" = "yes" ] && [ "$already_fell_back" = "0" ]; then
+    log "falling back to $other"
+    local omodel orig_backend="$bbackend"; omodel=$(jq -r --arg b "$other" '.[$b].default_model' "$CFG")
+    jq --arg b "$other" --arg m "$omodel" --arg fb "$orig_backend" '.backend=$b | .model=$m | .fallback_from=$fb' "$TASKDIR/$id.json" > "$TASKDIR/$id.tmp" && mv "$TASKDIR/$id.tmp" "$TASKDIR/$id.json"
+    execute_backend "$id" "$other" "$omodel" "$dir" "$timeout_s" "" "$prompt" "$tid_log" 1
+    return $?
+  fi
+  record_result "$id" failed "$bbackend" "$bmodel" "$conv" "$sid" "$tid_log" "error_class=$class; retries exhausted; fallback not taken (other=$other ready=$other_ready already_fell_back=$already_fell_back)"
+  return 1
+}
+
+record_result() { # id status backend model conv sid logfile note
+  local id="$1" status="$2" bbackend="$3" bmodel="$4" conv="$5" sid="$6" tid_log="$7" note="$8"
+  local changed="[]"
+  if [ -n "$conv$sid" ]; then changed=$(jq -R . <<<"resume_token=${conv:-$sid}"); changed="[$changed]"; fi
+  jq --arg s "$status" --arg b "$bbackend" --arg m "$bmodel" --arg n "$note" \
+     --arg log "$tid_log" --arg conv "$conv" --arg sid "$sid" \
+    '.status=$s | .backend=$b | .model=$m | .logs+=[$log] | .conversation_id=$conv | .session_id=$sid | .result={note:$n} | .handoff=("resume via: orchestrator resume \($id); backend=\($b)")' \
+    --arg id "$id" "$TASKDIR/$id.json" > "$TASKDIR/$id.tmp" && mv "$TASKDIR/$id.tmp" "$TASKDIR/$id.json"
+}
+
+# ---- logs ----
+cmd_logs() {
+  local id="$1"; shift; local tail_n=100
+  while [ $# -gt 0 ]; do case "$1" in --tail) tail_n="$2"; shift 2;; *) shift;; esac; done
+  [ -f "$TASKDIR/$id.json" ] || { echo "unknown task: $id" >&2; return 2; }
+  local lf; lf=$(jq -r '.logs[-1] // empty' "$TASKDIR/$id.json")
+  echo "== task $id =="; jq -r '{status, backend, model, result}' "$TASKDIR/$id.json"
+  [ -n "$lf" ] && [ -f "$lf" ] && { echo "== log tail =="; tail -n "$tail_n" "$lf"; }
+}
+
+# ---- resume ----
+cmd_resume() {
+  local id="$1"; shift
+  local timeout_override=""
+  while [ $# -gt 0 ]; do case "$1" in --timeout) timeout_override="$2"; shift 2;; *) shift;; esac; done
+  [ -f "$TASKDIR/$id.json" ] || { echo "unknown task: $id" >&2; return 2; }
+  local bbackend bmodel dir timeout_s conv sid prompt
+  bbackend=$(jq -r '.backend' "$TASKDIR/$id.json"); bmodel=$(jq -r '.model' "$TASKDIR/$id.json")
+  dir=$(jq -r '.workdir' "$TASKDIR/$id.json"); timeout_s=$(jq -r '.timeout_seconds' "$TASKDIR/$id.json")
+  [ -n "$timeout_override" ] && timeout_s="$timeout_override"
+  conv=$(jq -r '.conversation_id // empty' "$TASKDIR/$id.json")
+  sid=$(jq -r '.session_id // empty' "$TASKDIR/$id.json")
+  prompt=$(jq -r '.description' "$TASKDIR/$id.json")
+  log "resuming $id on $bbackend (continue previous session)"
+  local tid_log="$LOGDIR/$id.log"
+  if [ "$bbackend" = "opencode" ] || [ "$bbackend" = "qoder" ]; then
+    execute_backend "$id" "$bbackend" "$bmodel" "$dir" "$timeout_s" "$sid" "Continue the previous task. Original task: $prompt" "$tid_log"
+  else
+    execute_backend "$id" "$bbackend" "$bmodel" "$dir" "$timeout_s" "$conv" "Continue the previous task. Original task: $prompt" "$tid_log"
+  fi
+  handoff_note "$id"
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  plan) shift; [ $# -ge 1 ] || { echo 'usage: orchestrator plan "<task>" [options]' >&2; exit 2; }; cmd_plan "$@" ;;
+  run) shift; [ $# -ge 1 ] || { echo 'usage: orchestrator run "<task>" [options]' >&2; exit 2; }; cmd_run "$@" ;;
+  logs) shift; [ $# -ge 1 ] || { echo 'usage: orchestrator logs <task-id>' >&2; exit 2; }; cmd_logs "$@" ;;
+  resume) shift; [ $# -ge 1 ] || { echo 'usage: orchestrator resume <task-id>' >&2; exit 2; }; cmd_resume "$@" ;;
+  *) echo "usage: orchestrator {status|plan|run|logs|resume} ..." >&2; exit 2 ;;
+esac
