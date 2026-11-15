@@ -1,3 +1,5 @@
+![Multi-Agent Orchestrator](cover.png)
+
 # Multi-Agent Orchestrator
 
 **One coordinator. Three AI coding backends. Structured briefs, deterministic routing, verification gates, and a shared memory — so agent work is delegated like a team, not sprayed like a prompt.**
